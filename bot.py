@@ -1,5 +1,6 @@
 ﻿import os
-from flask import Flask, request
+import threading
+from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -9,16 +10,15 @@ import pandas as pd
 from groq import Groq
 
 # =========================
-# 🔑 KEYS
+# 🔑 KEYS (تأكد من إضافتها في Render Environment Variables)
 # =========================
 TOKEN = os.getenv("TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 client = Groq(api_key=GROQ_API_KEY)
 
 # =========================
-# 📊 DATA
+# 📊 TRADING LOGIC
 # =========================
 def get_data(symbol):
     data = yf.Ticker(symbol).history(period="6mo")
@@ -47,125 +47,82 @@ def trend(data):
 
 def signal(rsi_v, macd_v, macd_s, trend_v):
     score = 0
-
-    if rsi_v < 30:
-        score += 2
-    elif rsi_v > 70:
-        score -= 2
-
-    if macd_v.iloc[-1] > macd_s.iloc[-1]:
-        score += 1
-    else:
-        score -= 1
-
-    if trend_v == "UP":
-        score += 1
-    else:
-        score -= 1
-
-    if score >= 3:
-        return "BUY 🟢"
-    elif score <= -2:
-        return "SELL 🔴"
-    else:
-        return "WAIT ⚪"
+    if rsi_v < 30: score += 2
+    elif rsi_v > 70: score -= 2
+    if macd_v.iloc[-1] > macd_s.iloc[-1]: score += 1
+    else: score -= 1
+    if trend_v == "UP": score += 1
+    else: score -= 1
+    
+    if score >= 3: return "BUY 🟢"
+    elif score <= -2: return "SELL 🔴"
+    else: return "WAIT ⚪"
 
 def risk(price):
     sl = round(price * 0.97, 2)
     tp = round(price * 1.05, 2)
     return sl, tp
 
-def ai(symbol, price, sig, rsi_v, trend_v):
-    prompt = f"""
-You are a professional trading analyst.
-
-Stock: {symbol}
-Price: {price}
-Signal: {sig}
-RSI: {rsi_v}
-Trend: {trend_v}
-
-Explain:
-- market condition
-- risk
-- simple strategy
-"""
-
+def ai_analysis(symbol, price, sig, rsi_v, trend_v):
+    prompt = f"Analyze {symbol} at {price}. Signal: {sig}, RSI: {rsi_v}, Trend: {trend_v}. Short professional summary."
     res = client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}]
     )
-
     return res.choices[0].message.content
 
 # =========================
-# 🤖 TELEGRAM
+# 🤖 TELEGRAM HANDLERS
 # =========================
-app = ApplicationBuilder().token(TOKEN).build()
-
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        if not context.args:
+            await update.message.reply_text("💡 يرجى كتابة رمز السهم، مثال: /analyze NVDA")
+            return
+            
         symbol = context.args[0].upper()
         data = get_data(symbol)
 
         if data is None:
-            await update.message.reply_text("❌ No data")
+            await update.message.reply_text("❌ لم يتم العثور على بيانات لهذا السهم.")
             return
 
         price = round(data["Close"].iloc[-1], 2)
         rsi_v = rsi(data).iloc[-1]
         macd_v, macd_s = macd(data)
         trend_v = trend(data)
-
         sig = signal(rsi_v, macd_v, macd_s, trend_v)
         sl, tp = risk(price)
+        analysis = ai_analysis(symbol, price, sig, round(rsi_v, 2), trend_v)
 
-        analysis = ai(symbol, price, sig, round(rsi_v,2), trend_v)
-
-        await update.message.reply_text(f"""📊 {symbol} @ {price}$
-
-🎯 SIGNAL: {sig}
-
-🛑 SL: {sl}
-🎯 TP: {tp}
-
-📈 Trend: {trend_v}
-📉 RSI: {round(rsi_v,2)}
-
-🤖 AI:
-{analysis}
-""")
-
+        await update.message.reply_text(f"📊 {symbol} @ {price}$\n\n🎯 SIGNAL: {sig}\n🛑 SL: {sl}\n🎯 TP: {tp}\n\n📈 Trend: {trend_v}\n📉 RSI: {round(rsi_v, 2)}\n\n🤖 AI:\n{analysis}")
     except Exception as e:
-        print(e)
-        await update.message.reply_text("⚠️ error")
-
-app.add_handler(CommandHandler("analyze", analyze))
+        await update.message.reply_text(f"⚠️ حدث خطأ: {str(e)}")
 
 # =========================
-# 🌐 FLASK (WEBHOOK)
+# 🌐 FLASK SERVER (For Render Health Check)
 # =========================
 flask_app = Flask(__name__)
 
-@flask_app.route(f"/{TOKEN}", methods=["POST"])
-async def webhook():
-    data = request.get_json(force=True)
-    update = Update.de_json(data, app.bot)
-    await app.process_update(update)
-    return "ok"
-
-@flask_app.route("/")
+@flask_app.route('/')
 def home():
-    return "Bot is running!"
+    return "Bot is running!", 200
+
+def run_flask():
+    # Render بيطلب إننا نفتح Port وإلا بيعتبر التطبيق فشل
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host='0.0.0.0', port=port)
 
 # =========================
-# 🚀 RUN
+# 🚀 MAIN RUNNER
 # =========================
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 10000))
+    # 1. تشغيل Flask في Thread منفصل عشان ما يعطل البوت
+    threading.Thread(target=run_flask, daemon=True).start()
 
-    print("🚀 BOT RUNNING (WEBHOOK MODE)")
-
-    app.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
-
-    flask_app.run(host="0.0.0.0", port=PORT)
+    # 2. تشغيل البوت بنظام Polling
+    print("🚀 Bot is starting...")
+    application = ApplicationBuilder().token(TOKEN).build()
+    application.add_handler(CommandHandler("analyze", analyze))
+    
+    application.run_polling()
