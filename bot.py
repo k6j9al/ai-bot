@@ -1,4 +1,6 @@
-﻿from telegram import Update
+﻿import os
+from flask import Flask, request
+from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 import yfinance as yf
@@ -7,17 +9,16 @@ import pandas as pd
 from groq import Groq
 
 # =========================
-# 🔑 KEYS (حط مفاتيحك هنا)
+# 🔑 KEYS
 # =========================
-import os
-
 TOKEN = os.getenv("TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 client = Groq(api_key=GROQ_API_KEY)
 
 # =========================
-# 📊 GET DATA
+# 📊 DATA
 # =========================
 def get_data(symbol):
     data = yf.Ticker(symbol).history(period="6mo")
@@ -25,9 +26,6 @@ def get_data(symbol):
         return None
     return data
 
-# =========================
-# 📊 RSI
-# =========================
 def rsi(data):
     delta = data["Close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
@@ -35,9 +33,6 @@ def rsi(data):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# =========================
-# 📊 MACD
-# =========================
 def macd(data):
     fast = data["Close"].ewm(span=12).mean()
     slow = data["Close"].ewm(span=26).mean()
@@ -45,18 +40,11 @@ def macd(data):
     signal = line.ewm(span=9).mean()
     return line, signal
 
-# =========================
-# 📈 TREND
-# =========================
 def trend(data):
     ma20 = data["Close"].rolling(20).mean()
     ma50 = data["Close"].rolling(50).mean()
-
     return "UP" if ma20.iloc[-1] > ma50.iloc[-1] else "DOWN"
 
-# =========================
-# 🎯 SIGNAL ENGINE
-# =========================
 def signal(rsi_v, macd_v, macd_s, trend_v):
     score = 0
 
@@ -82,17 +70,11 @@ def signal(rsi_v, macd_v, macd_s, trend_v):
     else:
         return "WAIT ⚪"
 
-# =========================
-# 🛑 RISK
-# =========================
 def risk(price):
     sl = round(price * 0.97, 2)
     tp = round(price * 1.05, 2)
     return sl, tp
 
-# =========================
-# 🤖 AI EXPLANATION
-# =========================
 def ai(symbol, price, sig, rsi_v, trend_v):
     prompt = f"""
 You are a professional trading analyst.
@@ -117,12 +99,13 @@ Explain:
     return res.choices[0].message.content
 
 # =========================
-# 📊 COMMAND
+# 🤖 TELEGRAM
 # =========================
+app = ApplicationBuilder().token(TOKEN).build()
+
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         symbol = context.args[0].upper()
-
         data = get_data(symbol)
 
         if data is None:
@@ -130,19 +113,16 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         price = round(data["Close"].iloc[-1], 2)
-
         rsi_v = rsi(data).iloc[-1]
         macd_v, macd_s = macd(data)
         trend_v = trend(data)
 
         sig = signal(rsi_v, macd_v, macd_s, trend_v)
-
         sl, tp = risk(price)
 
         analysis = ai(symbol, price, sig, round(rsi_v,2), trend_v)
 
-        await update.message.reply_text(
-f"""📊 {symbol} @ {price}$
+        await update.message.reply_text(f"""📊 {symbol} @ {price}$
 
 🎯 SIGNAL: {sig}
 
@@ -154,18 +134,38 @@ f"""📊 {symbol} @ {price}$
 
 🤖 AI:
 {analysis}
-"""
-        )
+""")
 
     except Exception as e:
         print(e)
         await update.message.reply_text("⚠️ error")
 
-# =========================
-# 🚀 RUN BOT
-# =========================
-app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("analyze", analyze))
 
-print("🚀 BOT RUNNING 24/7 READY")
-app.run_polling()
+# =========================
+# 🌐 FLASK (WEBHOOK)
+# =========================
+flask_app = Flask(__name__)
+
+@flask_app.route(f"/{TOKEN}", methods=["POST"])
+async def webhook():
+    data = request.get_json(force=True)
+    update = Update.de_json(data, app.bot)
+    await app.process_update(update)
+    return "ok"
+
+@flask_app.route("/")
+def home():
+    return "Bot is running!"
+
+# =========================
+# 🚀 RUN
+# =========================
+if __name__ == "__main__":
+    PORT = int(os.environ.get("PORT", 10000))
+
+    print("🚀 BOT RUNNING (WEBHOOK MODE)")
+
+    app.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+
+    flask_app.run(host="0.0.0.0", port=PORT)
